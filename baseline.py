@@ -8,19 +8,20 @@ st.set_page_config(page_title="Guardian Baseline Builder (EAN)", layout="wide")
 # ============================================================
 # Helpers
 # ============================================================
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    # Trim spaces, unify internal spaces, keep original but add a normalized view
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+def cols_upper(df: pd.DataFrame) -> list[str]:
+    return [str(c).strip().upper() for c in df.columns]
+
 def ensure_datetime_dmy(s: pd.Series) -> pd.Series:
-    # your data: dd/mm/yy
     dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
     return dt.dt.normalize()
 
 def parse_support_pct_0_100(s: pd.Series) -> pd.Series:
-    """
-    Input examples:
-      '23%' -> 23
-      '0%'  -> 0
-      23    -> 23
-      0.23  -> 0.23 (we keep as-is; but your expected input is 23%)
-    """
     x = s.astype(str).str.strip().str.replace("%", "", regex=False)
     return pd.to_numeric(x, errors="coerce")
 
@@ -54,40 +55,68 @@ def to_excel_bytes(tables: dict[str, pd.DataFrame]) -> bytes:
             df.to_excel(writer, sheet_name=k[:31], index=False)
     return output.getvalue()
 
+def safe_error(msg: str, details: dict | None = None):
+    st.error(msg)
+    if details:
+        with st.expander("Debug info (safe)"):
+            for k, v in details.items():
+                st.write(f"**{k}:** {v}")
+
 # ============================================================
-# Standardize input files to expected schema
+# Standardize input files with aliases
 # ============================================================
+UNIT_ALIASES = {
+    # target -> possible headers (upper-normalized)
+    "EAN CODE": ["EAN CODE", "EAN", "EAN_CODE", "EANCODE", "BARCODE", "EAN BARCODE"],
+    "SUPPORT%": ["SUPPORT%", "SUPPORT %", "SUPPORT_PCT", "SUPPORT PCT", "DISCOUNT%", "DISCOUNT %", "DISC%"],
+    "SUM OF QTY SUM": ["SUM OF QTY SUM", "SUM OF QTY", "QTY", "QTY SUM", "SUM OF QTY", "UNITS", "UNIT SOLD", "UNIT_SOLD"],
+    "TRANSACTION DATE": ["TRANSACTION DATE", "TRANSACTION_DATE", "TRANSACTIONDATE", "DATE", "TRANS DATE"],
+    "QUARTER": ["QUARTER", "QTR", "QUARTER NO", "QUARTER_NUMBER"],
+    "MPL 2026": ["MPL 2026", "MPL2026", "MPL", "MPL NAME", "MPL_NAME"],
+}
+
+SEAS_ALIASES = {
+    "DATE": ["DATE", "TRANSACTION DATE", "TRANSACTION_DATE", "CALENDAR DATE", "CALDATE"],
+}
+
+def find_col_by_alias(df: pd.DataFrame, candidates_upper: list[str]) -> str | None:
+    # Return actual column name that matches any candidate (case-insensitive)
+    upper_map = {str(c).strip().upper(): c for c in df.columns}
+    for cu in candidates_upper:
+        if cu in upper_map:
+            return upper_map[cu]
+    return None
+
 def standardize_unit_file(df_raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    Expect EXACT headers from your sample:
-      EAN CODE, Support%, Sum of Qty Sum, Transaction Date, Quarter, MPL 2026
-    Output schema:
-      transaction_date, quarter, ean, mpl, unit_sold, discount_pct, promo_type
-    """
-    df = df_raw.copy()
+    df = normalize_columns(df_raw)
 
-    expected = {
-        "EAN CODE": "ean",
-        "Support%": "discount_pct",
-        "Sum of Qty Sum": "unit_sold",
-        "Transaction Date": "transaction_date",
-        "Quarter": "quarter_raw",
-        "MPL 2026": "mpl",
-    }
-    missing = [c for c in expected if c not in df.columns]
+    # resolve each required column via aliases
+    resolved = {}
+    for canonical, alias_list in UNIT_ALIASES.items():
+        actual = find_col_by_alias(df, [a.upper() for a in alias_list])
+        if actual is None:
+            resolved[canonical] = None
+        else:
+            resolved[canonical] = actual
+
+    missing = [k for k, v in resolved.items() if v is None]
     if missing:
-        raise ValueError(
-            "Kolom berikut tidak ditemukan di unit sold file: "
-            + ", ".join(missing)
-            + ". Pastikan header sama persis."
-        )
+        raise ValueError(f"Missing required columns (after alias matching): {missing}")
 
-    df = df.rename(columns=expected)
+    # rename into internal schema
+    df = df.rename(columns={
+        resolved["EAN CODE"]: "ean",
+        resolved["SUPPORT%"]: "discount_pct",
+        resolved["SUM OF QTY SUM"]: "unit_sold",
+        resolved["TRANSACTION DATE"]: "transaction_date",
+        resolved["QUARTER"]: "quarter_raw",
+        resolved["MPL 2026"]: "mpl",
+    })
 
     # types
     df["transaction_date"] = ensure_datetime_dmy(df["transaction_date"])
     if df["transaction_date"].isna().all():
-        raise ValueError("Transaction Date tidak bisa diparse. Pastikan format dd/mm/yy atau dd/mm/yyyy.")
+        raise ValueError("Transaction Date gagal diparse. Pastikan format dd/mm/yy atau dd/mm/yyyy.")
 
     df["ean"] = df["ean"].astype(str).str.strip()
     df["mpl"] = df["mpl"].astype(str).str.strip()
@@ -95,37 +124,32 @@ def standardize_unit_file(df_raw: pd.DataFrame) -> pd.DataFrame:
     df["unit_sold"] = pd.to_numeric(df["unit_sold"], errors="coerce")
     df["discount_pct"] = parse_support_pct_0_100(df["discount_pct"])  # 23% -> 23
 
-    # quarter: build YYYYQ# using year from transaction_date
     q = pd.to_numeric(df["quarter_raw"], errors="coerce").astype("Int64")
     year = df["transaction_date"].dt.year.astype("Int64")
     df["quarter"] = year.astype(str) + "Q" + q.astype(str)
 
-    # promo_type not provided -> set default
     df["promo_type"] = "UNKNOWN"
 
     return df[["transaction_date", "quarter", "ean", "mpl", "unit_sold", "discount_pct", "promo_type"]]
 
 def standardize_seasonality_file(df_raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    Your seasonality file format:
-      Date, Holiday
-    We use Date only.
-    """
-    df = df_raw.copy()
-    if "Date" not in df.columns:
-        raise ValueError("Seasonality file harus punya kolom 'Date' (sesuai format kamu).")
+    df = normalize_columns(df_raw)
 
-    df = df.rename(columns={"Date": "transaction_date"})
+    date_col = find_col_by_alias(df, [a.upper() for a in SEAS_ALIASES["DATE"]])
+    if date_col is None:
+        raise ValueError("Seasonality file: kolom tanggal tidak ditemukan. Kolom yang dicari: Date / Transaction Date / Calendar Date.")
+
+    df = df.rename(columns={date_col: "transaction_date"})
     df["transaction_date"] = ensure_datetime_dmy(df["transaction_date"])
     if df["transaction_date"].isna().all():
-        raise ValueError("Kolom Date di seasonality tidak bisa diparse. Pastikan format dd/mm/yy atau dd/mm/yyyy.")
+        raise ValueError("Seasonality Date gagal diparse. Pastikan format dd/mm/yy atau dd/mm/yyyy.")
+
     return df[["transaction_date"]].dropna().drop_duplicates()
 
 # ============================================================
 # Core processing
 # ============================================================
 def build_outputs(unit_df, seasonality_df, upper_q, lower_q, trim_ratio):
-    # Table 1: by MPL daily + seasonality flag
     table1 = (
         unit_df.groupby(["transaction_date", "quarter", "mpl", "discount_pct", "promo_type"], as_index=False)
                .agg(unit_sold=("unit_sold", "sum"))
@@ -133,7 +157,6 @@ def build_outputs(unit_df, seasonality_df, upper_q, lower_q, trim_ratio):
     seas_set = set(seasonality_df["transaction_date"].unique())
     table1["seasonality_flag"] = np.where(table1["transaction_date"].isin(seas_set), "Y", "N")
 
-    # Table 2: outlier bank using only non-seasonality
     base_for_fence = table1.loc[
         (table1["seasonality_flag"] == "N") & table1["unit_sold"].notna(),
         ["mpl", "quarter", "unit_sold"]
@@ -150,7 +173,6 @@ def build_outputs(unit_df, seasonality_df, upper_q, lower_q, trim_ratio):
     fence["lower_q"] = float(lower_q)
     table2 = fence[["mpl", "quarter", "upper_q", "lower_q", "upper_fence", "lower_fence"]].copy()
 
-    # Table 3: cleaned + outlier flag
     table3 = table1.merge(
         table2[["mpl", "quarter", "upper_fence", "lower_fence"]],
         on=["mpl", "quarter"],
@@ -166,7 +188,6 @@ def build_outputs(unit_df, seasonality_df, upper_q, lower_q, trim_ratio):
         "N"
     )
 
-    # Table 4: baseline (Mon-Fri only) + filters seasonality N & outlier N
     weekday_ok = table3["transaction_date"].dt.weekday <= 4
     baseline_input = table3.loc[
         (table3["seasonality_flag"] == "N") &
@@ -195,74 +216,83 @@ def build_outputs(unit_df, seasonality_df, upper_q, lower_q, trim_ratio):
 # ============================================================
 # UI
 # ============================================================
-st.title("Guardian Baseline Builder (Exact Headers: EAN CODE / Support% / MPL 2026)")
+st.title("Guardian Baseline Builder (Robust: EAN CODE + Seasonality Date)")
 
 with st.sidebar:
     st.header("Parameters")
     upper_q = st.number_input("Upper fence percentile (0-1)", 0.0, 1.0, 0.80, 0.01)
     lower_q = st.number_input("Lower fence percentile (0-1)", 0.0, 1.0, 0.10, 0.01)
     trim_ratio = st.number_input("Trim ratio (0-0.8)", 0.0, 0.8, 0.20, 0.05)
-    st.caption("Support% dibaca sebagai 23% -> 23 (0-100 scale).")
+    st.caption("Support% dibaca 23% -> 23 (skala 0-100).")
 
 c1, c2 = st.columns(2)
 with c1:
-    f_unit = st.file_uploader(
-        "1) Unit sold file (EAN CODE, Support%, Sum of Qty Sum, Transaction Date, Quarter, MPL 2026)",
-        type=["csv", "xlsx", "xls", "parquet"]
-    )
+    f_unit = st.file_uploader("1) Unit sold file (EAN, Support%, Qty, Transaction Date, Quarter, MPL)", type=["csv", "xlsx", "xls", "parquet"])
 with c2:
-    f_seas = st.file_uploader(
-        "2) Seasonality file (Date, Holiday)",
-        type=["csv", "xlsx", "xls", "parquet"]
-    )
+    f_seas = st.file_uploader("2) Seasonality file (Date, Holiday)", type=["csv", "xlsx", "xls", "parquet"])
 
 if f_unit and f_seas:
-    unit_raw = read_any_table(f_unit)
-    seas_raw = read_any_table(f_seas)
+    try:
+        unit_raw = read_any_table(f_unit)
+        seas_raw = read_any_table(f_seas)
 
-    st.subheader("Preview")
-    st.write("Unit sold file (top 15 rows):")
-    st.dataframe(unit_raw.head(15), use_container_width=True)
+        unit_raw = normalize_columns(unit_raw)
+        seas_raw = normalize_columns(seas_raw)
 
-    st.write("Seasonality file (top 15 rows):")
-    st.dataframe(seas_raw.head(15), use_container_width=True)
+        with st.expander("Debug: detected columns"):
+            st.write("**Unit file columns:**", list(unit_raw.columns))
+            st.write("**Seasonality file columns:**", list(seas_raw.columns))
 
-    if st.button("Run baseline calculation", type="primary"):
-        if lower_q >= upper_q:
-            st.error("Lower percentile must be < Upper percentile.")
-            st.stop()
+        st.subheader("Preview")
+        st.write("Unit sold file (top 10 rows):")
+        st.dataframe(unit_raw.head(10), use_container_width=True)
+        st.write("Seasonality file (top 10 rows):")
+        st.dataframe(seas_raw.head(10), use_container_width=True)
 
-        unit_df = standardize_unit_file(unit_raw)
-        seas_df = standardize_seasonality_file(seas_raw)
+        if st.button("Run baseline calculation", type="primary"):
+            if lower_q >= upper_q:
+                st.error("Lower percentile must be < Upper percentile.")
+                st.stop()
 
-        outputs = build_outputs(
-            unit_df=unit_df,
-            seasonality_df=seas_df,
-            upper_q=float(upper_q),
-            lower_q=float(lower_q),
-            trim_ratio=float(trim_ratio),
+            unit_df = standardize_unit_file(unit_raw)
+            seas_df = standardize_seasonality_file(seas_raw)
+
+            outputs = build_outputs(
+                unit_df=unit_df,
+                seasonality_df=seas_df,
+                upper_q=float(upper_q),
+                lower_q=float(lower_q),
+                trim_ratio=float(trim_ratio),
+            )
+
+            st.success("Done!")
+
+            tabs = st.tabs(["Table 1", "Table 2", "Table 3", "Table 4 (Baseline)"])
+            keys = [
+                "table1_unit_by_mpl",
+                "table2_outlier_bank",
+                "table3_unit_by_mpl_cleaned",
+                "table4_baseline_daily_by_mpl",
+            ]
+            for t, k in zip(tabs, keys):
+                with t:
+                    st.dataframe(outputs[k], use_container_width=True)
+
+            xbytes = to_excel_bytes(outputs)
+            st.download_button(
+                "Download all tables (Excel)",
+                data=xbytes,
+                file_name="guardian_baseline_outputs.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+    except Exception as e:
+        safe_error(
+            "Processing failed. Biasanya karena header beda / tanggal tidak kebaca / ada kolom missing.",
+            {
+                "error_type": type(e).__name__,
+                "error_message": str(e),
+            }
         )
-
-        st.success("Done!")
-
-        tabs = st.tabs(["Table 1", "Table 2", "Table 3", "Table 4 (Baseline)"])
-        keys = [
-            "table1_unit_by_mpl",
-            "table2_outlier_bank",
-            "table3_unit_by_mpl_cleaned",
-            "table4_baseline_daily_by_mpl",
-        ]
-        for t, k in zip(tabs, keys):
-            with t:
-                st.dataframe(outputs[k], use_container_width=True)
-
-        xbytes = to_excel_bytes(outputs)
-        st.download_button(
-            "Download all tables (Excel)",
-            data=xbytes,
-            file_name="guardian_baseline_outputs.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
 else:
     st.info("Upload dua file: unit sold + seasonality.")
