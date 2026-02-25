@@ -65,6 +65,27 @@ def safe_error(msg: str, err: Exception):
         st.write(f"Type: {type(err).__name__}")
         st.write(f"Message: {str(err)}")
 
+def add_quarter_index(df: pd.DataFrame, quarter_col: str = "quarter") -> pd.DataFrame:
+    """
+    Convert 'YYYYQ#' into sortable index: YYYY*10 + Q
+    """
+    out = df.copy()
+    year = out[quarter_col].astype(str).str.extract(r"(\d{4})")[0].astype(float)
+    q = out[quarter_col].astype(str).str.extract(r"Q([1-4])")[0].astype(float)
+    out["quarter_index"] = (year * 10 + q).astype("Int64")
+    return out
+
+def normalize_channel_value(x) -> str:
+    """Normalize Online/Offline values to 'OFFLINE' or 'ONLINE' if possible."""
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return ""
+    s = str(x).strip().upper()
+    if s in {"OFFLINE", "OFF LINE", "OFF-LINE", "STORE", "INSTORE", "IN-STORE"}:
+        return "OFFLINE"
+    if s in {"ONLINE", "ON LINE", "ON-LINE", "ECOM", "E-COM", "E-COMMERCE"}:
+        return "ONLINE"
+    return s
+
 # ============================================================
 # Column aliases (robust)
 # ============================================================
@@ -75,6 +96,13 @@ UNIT_ALIASES = {
     "TRANSACTION DATE": ["TRANSACTION DATE", "TRANSACTION_DATE", "TRANSACTIONDATE", "DATE", "TRANS DATE"],
     "QUARTER": ["QUARTER", "QTR", "QUARTER NO", "QUARTER_NUMBER"],
     "MPL 2026": ["MPL 2026", "MPL2026", "MPL", "MPL NAME", "MPL_NAME"],
+    # NEW: channel column supports "Type Store"
+    "ONLINE/OFFLINE": [
+        "ONLINE/OFFLINE", "ONLINE OFFLINE", "CHANNEL", "SALES CHANNEL", "ONLINE_OFFLINE",
+        "TYPE STORE", "TYPE_STORE"
+    ],
+    # NEW: promo type supports "Promotion Type"
+    "PROMO TYPE": ["PROMOTION TYPE", "PROMO TYPE", "PROMO_TYPE", "PROMOTION_TYPE"],
 }
 
 SEAS_ALIASES = {
@@ -89,25 +117,51 @@ def find_col_by_alias(df: pd.DataFrame, candidates_upper: list[str]) -> str | No
     return None
 
 def standardize_unit_file(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Standardize + FILTER OFFLINE ONLY.
+    Also captures Promotion Type as promo_type (if available).
+    """
     df = normalize_columns(df_raw)
 
     resolved = {}
     for canonical, alias_list in UNIT_ALIASES.items():
         resolved[canonical] = find_col_by_alias(df, [a.upper() for a in alias_list])
 
-    missing = [k for k, v in resolved.items() if v is None]
-    if missing:
-        raise ValueError(f"Missing required columns in unit file: {missing}")
+    # Promo type is optional, others required
+    required = ["EAN CODE", "SUPPORT%", "SUM OF QTY SUM", "TRANSACTION DATE", "QUARTER", "MPL 2026", "ONLINE/OFFLINE"]
+    missing_required = [k for k in required if resolved.get(k) is None]
+    if missing_required:
+        raise ValueError(f"Missing required columns in unit file: {missing_required}")
 
-    df = df.rename(columns={
+    rename_map = {
         resolved["EAN CODE"]: "ean",
         resolved["SUPPORT%"]: "discount_pct",
         resolved["SUM OF QTY SUM"]: "unit_sold",
         resolved["TRANSACTION DATE"]: "transaction_date",
         resolved["QUARTER"]: "quarter_raw",
         resolved["MPL 2026"]: "mpl",
-    })
+        resolved["ONLINE/OFFLINE"]: "channel",
+    }
 
+    promo_col = resolved.get("PROMO TYPE")
+    if promo_col is not None:
+        rename_map[promo_col] = "promo_type"
+
+    df = df.rename(columns=rename_map)
+
+    # --- Filter OFFLINE only (IMPORTANT)
+    df["channel_norm"] = df["channel"].apply(normalize_channel_value)
+    df_off = df[df["channel_norm"] == "OFFLINE"].copy()
+    if df_off.empty:
+        unique_vals = sorted(set(df["channel_norm"].dropna().unique().tolist()))
+        raise ValueError(
+            "No rows found for OFFLINE after filtering. "
+            f"Detected channel values: {unique_vals}. "
+            "Please ensure the Type Store / Online-Offline column contains 'Offline'."
+        )
+    df = df_off
+
+    # types
     df["transaction_date"] = ensure_datetime_dmy(df["transaction_date"])
     if df["transaction_date"].isna().all():
         raise ValueError("Transaction Date gagal diparse. Pastikan format dd/mm/yy atau dd/mm/yyyy.")
@@ -118,15 +172,22 @@ def standardize_unit_file(df_raw: pd.DataFrame) -> pd.DataFrame:
     df["unit_sold"] = pd.to_numeric(df["unit_sold"], errors="coerce")
     df["discount_pct"] = parse_support_pct_0_100(df["discount_pct"])  # 23% -> 23
 
+    # promo_type (optional)
+    if "promo_type" not in df.columns:
+        df["promo_type"] = "UNKNOWN"
+    else:
+        df["promo_type"] = df["promo_type"].astype(str).str.strip().replace({"nan": "UNKNOWN", "None": "UNKNOWN"})
+        df.loc[df["promo_type"].isin(["", "NAN"]), "promo_type"] = "UNKNOWN"
+
     # Build quarter label: YYYYQ#
     q = pd.to_numeric(df["quarter_raw"], errors="coerce").astype("Int64")
     year = df["transaction_date"].dt.year.astype("Int64")
     df["quarter"] = year.astype(str) + "Q" + q.astype(str)
 
-    # Not provided in your file -> default
-    df["promo_type"] = "UNKNOWN"
+    # Keep channel for traceability (optional)
+    df = df.rename(columns={"channel_norm": "channel"})
 
-    return df[["transaction_date", "quarter", "ean", "mpl", "unit_sold", "discount_pct", "promo_type"]]
+    return df[["transaction_date", "quarter", "ean", "mpl", "unit_sold", "discount_pct", "promo_type", "channel"]]
 
 def standardize_seasonality_file(df_raw: pd.DataFrame) -> pd.DataFrame:
     df = normalize_columns(df_raw)
@@ -146,6 +207,8 @@ def standardize_seasonality_file(df_raw: pd.DataFrame) -> pd.DataFrame:
 # Core processing
 # ============================================================
 def build_cleaned_and_baseline(unit_df, seasonality_df, upper_q, lower_q, trim_ratio):
+    # unit_df is already OFFLINE-only
+
     # Internal Table 1: daily by MPL
     t1 = (
         unit_df.groupby(["transaction_date", "quarter", "mpl", "discount_pct", "promo_type"], as_index=False)
@@ -213,6 +276,7 @@ with st.sidebar:
     upper_q = st.number_input("Upper fence percentile", 0.0, 1.0, 0.80, 0.01)
     lower_q = st.number_input("Lower fence percentile", 0.0, 1.0, 0.10, 0.01)
     trim_ratio = st.number_input("Trim ratio", 0.0, 0.8, 0.20, 0.05)
+    st.caption("Note: Tool will automatically use OFFLINE rows only (Type Store = OFFLINE).")
 
 c1, c2 = st.columns(2)
 with c1:
@@ -238,13 +302,13 @@ if clicked:
             unit_raw = read_any_table(f_unit)
             seas_raw = read_any_table(f_seas)
 
-            status.write("Step 2/5: Validating & standardizing columns...")
+            status.write("Step 2/5: Validating, filtering OFFLINE, & standardizing columns...")
             progress.progress(30)
 
-            unit_df = standardize_unit_file(unit_raw)
+            unit_df = standardize_unit_file(unit_raw)  # OFFLINE-only filter happens here
             seas_df = standardize_seasonality_file(seas_raw)
 
-            status.write("Step 3/5: Calculating outliers & cleaned daily...")
+            status.write("Step 3/5: Calculating outliers & cleaned daily (OFFLINE only)...")
             progress.progress(60)
 
             cleaned_daily, baseline = build_cleaned_and_baseline(
@@ -269,6 +333,43 @@ if clicked:
 
         st.success("Completed")
 
+        # ============================================================
+        # Baseline trend chart (Top 20 MPL selector)
+        # ============================================================
+        st.subheader("Baseline trend (quarter-to-quarter)")
+
+        baseline_for_rank = baseline.copy()
+        baseline_for_rank["mpl"] = baseline_for_rank["mpl"].astype(str).str.strip()
+
+        mpl_rank = (
+            baseline_for_rank.groupby("mpl")["quarter"]
+            .nunique()
+            .sort_values(ascending=False)
+        )
+        top20_mpl = mpl_rank.head(20).index.tolist()
+
+        if not top20_mpl:
+            st.warning("No baseline data available to plot.")
+        else:
+            default_mpl = "MYB_SSMI" if "MYB_SSMI" in top20_mpl else top20_mpl[0]
+            selected_mpl = st.selectbox(
+                "Select MPL (Top 20 by coverage)",
+                top20_mpl,
+                index=top20_mpl.index(default_mpl)
+            )
+
+            chart_df = baseline_for_rank[baseline_for_rank["mpl"] == selected_mpl].copy()
+            chart_df = add_quarter_index(chart_df, "quarter").sort_values("quarter_index")
+
+            if chart_df.empty:
+                st.warning(f'No baseline found for "{selected_mpl}".')
+            else:
+                st.caption(f'Showing baseline trend for: {selected_mpl}')
+                st.line_chart(chart_df.set_index("quarter")[["baseline"]])
+
+        # ============================================================
+        # Tables (simplified)
+        # ============================================================
         tab1, tab2 = st.tabs([
             "Daily unit sold by MPL - cleaned up",
             "Baseline by MPL x quarter"
