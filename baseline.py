@@ -1,4 +1,5 @@
 import io
+import re
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -10,16 +11,28 @@ st.set_page_config(page_title="Guardian Baseline Tool", layout="wide")
 # ============================================================
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
+    df.columns = [str(c) for c in df.columns]
     return df
 
+def norm_key(s: str) -> str:
+    """
+    Normalize column name to robust matching key:
+    - uppercase
+    - replace non-alphanumeric with space
+    - collapse spaces
+    """
+    s = str(s)
+    s = s.replace("\u00A0", " ")  # NBSP -> space
+    s = s.strip().upper()
+    s = re.sub(r"[^A-Z0-9]+", " ", s)   # keep only A-Z0-9, others -> space
+    s = re.sub(r"\s+", " ", s).strip() # collapse spaces
+    return s
+
 def ensure_datetime_dmy(s: pd.Series) -> pd.Series:
-    # Input format: dd/mm/yy (e.g., 01/01/25)
     dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
     return dt.dt.normalize()
 
 def parse_support_pct_0_100(s: pd.Series) -> pd.Series:
-    # "23%" -> 23
     x = s.astype(str).str.strip().str.replace("%", "", regex=False)
     return pd.to_numeric(x, errors="coerce")
 
@@ -29,7 +42,7 @@ def trimmed_mean(arr: np.ndarray, trim_ratio: float = 0.20) -> float:
     n = arr.size
     if n == 0:
         return np.nan
-    k = int(np.floor((trim_ratio / 2.0) * n))  # each side
+    k = int(np.floor((trim_ratio / 2.0) * n))
     if n - 2 * k <= 0:
         return np.nan
     arr_sorted = np.sort(arr)
@@ -66,9 +79,6 @@ def safe_error(msg: str, err: Exception):
         st.write(f"Message: {str(err)}")
 
 def add_quarter_index(df: pd.DataFrame, quarter_col: str = "quarter") -> pd.DataFrame:
-    """
-    Convert 'YYYYQ#' into sortable index: YYYY*10 + Q
-    """
     out = df.copy()
     year = out[quarter_col].astype(str).str.extract(r"(\d{4})")[0].astype(float)
     q = out[quarter_col].astype(str).str.extract(r"Q([1-4])")[0].astype(float)
@@ -76,10 +86,11 @@ def add_quarter_index(df: pd.DataFrame, quarter_col: str = "quarter") -> pd.Data
     return out
 
 def normalize_channel_value(x) -> str:
-    """Normalize Online/Offline values to 'OFFLINE' or 'ONLINE' if possible."""
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return ""
     s = str(x).strip().upper()
+    s = s.replace("\u00A0", " ")
+    s = re.sub(r"\s+", " ", s).strip()
     if s in {"OFFLINE", "OFF LINE", "OFF-LINE", "STORE", "INSTORE", "IN-STORE"}:
         return "OFFLINE"
     if s in {"ONLINE", "ON LINE", "ON-LINE", "ECOM", "E-COM", "E-COMMERCE"}:
@@ -96,12 +107,13 @@ UNIT_ALIASES = {
     "TRANSACTION DATE": ["TRANSACTION DATE", "TRANSACTION_DATE", "TRANSACTIONDATE", "DATE", "TRANS DATE"],
     "QUARTER": ["QUARTER", "QTR", "QUARTER NO", "QUARTER_NUMBER"],
     "MPL 2026": ["MPL 2026", "MPL2026", "MPL", "MPL NAME", "MPL_NAME"],
-    # NEW: channel column supports "Type Store"
+    # Channel column: your real header is "Type Store"
     "ONLINE/OFFLINE": [
-        "ONLINE/OFFLINE", "ONLINE OFFLINE", "CHANNEL", "SALES CHANNEL", "ONLINE_OFFLINE",
-        "TYPE STORE", "TYPE_STORE"
+        "ONLINE/OFFLINE", "ONLINE OFFLINE", "ONLINE_OFFLINE",
+        "CHANNEL", "SALES CHANNEL",
+        "TYPE STORE", "TYPE_STORE", "TYPE-STORE", "TYPESTORE"
     ],
-    # NEW: promo type supports "Promotion Type"
+    # Promo type: your real header is "Promotion Type"
     "PROMO TYPE": ["PROMOTION TYPE", "PROMO TYPE", "PROMO_TYPE", "PROMOTION_TYPE"],
 }
 
@@ -109,11 +121,15 @@ SEAS_ALIASES = {
     "DATE": ["DATE", "TRANSACTION DATE", "TRANSACTION_DATE", "CALENDAR DATE", "CALDATE"],
 }
 
-def find_col_by_alias(df: pd.DataFrame, candidates_upper: list[str]) -> str | None:
-    upper_map = {str(c).strip().upper(): c for c in df.columns}
-    for cu in candidates_upper:
-        if cu in upper_map:
-            return upper_map[cu]
+def find_col_by_alias(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    """
+    Match by normalized key (handles extra spaces, underscores, hyphens, NBSP, etc.)
+    """
+    key_to_actual = {norm_key(c): c for c in df.columns}
+    for cand in candidates:
+        ck = norm_key(cand)
+        if ck in key_to_actual:
+            return key_to_actual[ck]
     return None
 
 def standardize_unit_file(df_raw: pd.DataFrame) -> pd.DataFrame:
@@ -125,13 +141,14 @@ def standardize_unit_file(df_raw: pd.DataFrame) -> pd.DataFrame:
 
     resolved = {}
     for canonical, alias_list in UNIT_ALIASES.items():
-        resolved[canonical] = find_col_by_alias(df, [a.upper() for a in alias_list])
+        resolved[canonical] = find_col_by_alias(df, alias_list)
 
-    # Promo type is optional, others required
     required = ["EAN CODE", "SUPPORT%", "SUM OF QTY SUM", "TRANSACTION DATE", "QUARTER", "MPL 2026", "ONLINE/OFFLINE"]
     missing_required = [k for k in required if resolved.get(k) is None]
     if missing_required:
-        raise ValueError(f"Missing required columns in unit file: {missing_required}")
+        # show detected columns (safe) to help debugging without showing values
+        detected = [str(c) for c in df.columns]
+        raise ValueError(f"Missing required columns in unit file: {missing_required}. Detected columns: {detected}")
 
     rename_map = {
         resolved["EAN CODE"]: "ean",
@@ -157,7 +174,7 @@ def standardize_unit_file(df_raw: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(
             "No rows found for OFFLINE after filtering. "
             f"Detected channel values: {unique_vals}. "
-            "Please ensure the Type Store / Online-Offline column contains 'Offline'."
+            "Please ensure Type Store column contains 'OFFLINE'."
         )
     df = df_off
 
@@ -176,15 +193,14 @@ def standardize_unit_file(df_raw: pd.DataFrame) -> pd.DataFrame:
     if "promo_type" not in df.columns:
         df["promo_type"] = "UNKNOWN"
     else:
-        df["promo_type"] = df["promo_type"].astype(str).str.strip().replace({"nan": "UNKNOWN", "None": "UNKNOWN"})
-        df.loc[df["promo_type"].isin(["", "NAN"]), "promo_type"] = "UNKNOWN"
+        df["promo_type"] = df["promo_type"].astype(str).str.strip()
+        df.loc[df["promo_type"].isin(["", "nan", "None", "NAN"]), "promo_type"] = "UNKNOWN"
 
     # Build quarter label: YYYYQ#
     q = pd.to_numeric(df["quarter_raw"], errors="coerce").astype("Int64")
     year = df["transaction_date"].dt.year.astype("Int64")
     df["quarter"] = year.astype(str) + "Q" + q.astype(str)
 
-    # Keep channel for traceability (optional)
     df = df.rename(columns={"channel_norm": "channel"})
 
     return df[["transaction_date", "quarter", "ean", "mpl", "unit_sold", "discount_pct", "promo_type", "channel"]]
@@ -192,7 +208,7 @@ def standardize_unit_file(df_raw: pd.DataFrame) -> pd.DataFrame:
 def standardize_seasonality_file(df_raw: pd.DataFrame) -> pd.DataFrame:
     df = normalize_columns(df_raw)
 
-    date_col = find_col_by_alias(df, [a.upper() for a in SEAS_ALIASES["DATE"]])
+    date_col = find_col_by_alias(df, SEAS_ALIASES["DATE"])
     if date_col is None:
         raise ValueError("Seasonality file: kolom tanggal tidak ditemukan (contoh: Date).")
 
@@ -209,7 +225,7 @@ def standardize_seasonality_file(df_raw: pd.DataFrame) -> pd.DataFrame:
 def build_cleaned_and_baseline(unit_df, seasonality_df, upper_q, lower_q, trim_ratio):
     # unit_df is already OFFLINE-only
 
-    # Internal Table 1: daily by MPL
+    # Daily by MPL (still keeps discount_pct & promo_type)
     t1 = (
         unit_df.groupby(["transaction_date", "quarter", "mpl", "discount_pct", "promo_type"], as_index=False)
                .agg(unit_sold=("unit_sold", "sum"))
@@ -219,7 +235,7 @@ def build_cleaned_and_baseline(unit_df, seasonality_df, upper_q, lower_q, trim_r
     seas_set = set(seasonality_df["transaction_date"].unique())
     t1["seasonality_flag"] = np.where(t1["transaction_date"].isin(seas_set), "Y", "N")
 
-    # Internal Table 2: outlier fences (non-seasonality only)
+    # outlier fences (non-seasonality only)
     base_for_fence = t1.loc[
         (t1["seasonality_flag"] == "N") & t1["unit_sold"].notna(),
         ["mpl", "quarter", "unit_sold"]
@@ -233,7 +249,7 @@ def build_cleaned_and_baseline(unit_df, seasonality_df, upper_q, lower_q, trim_r
         .rename(columns={lower_q: "lower_fence", upper_q: "upper_fence"})
     )
 
-    # Shown Table 3: cleaned daily (includes flags + fences)
+    # cleaned daily (Table 3)
     t3 = t1.merge(fence, on=["mpl", "quarter"], how="left")
 
     in_fence = t3["unit_sold"].ge(t3["lower_fence"]) & t3["unit_sold"].le(t3["upper_fence"])
@@ -243,7 +259,7 @@ def build_cleaned_and_baseline(unit_df, seasonality_df, upper_q, lower_q, trim_r
         "N"
     )
 
-    # Shown Table 4: baseline by MPL x quarter
+    # baseline (Table 4)
     weekday_ok = t3["transaction_date"].dt.weekday <= 4  # Mon-Fri only
     baseline_input = t3.loc[
         (t3["seasonality_flag"] == "N") &
@@ -260,8 +276,6 @@ def build_cleaned_and_baseline(unit_df, seasonality_df, upper_q, lower_q, trim_r
         baseline_input.groupby(["mpl", "quarter"], as_index=False)
                       .agg(baseline=("unit_sold", agg_trimmean))
     )
-
-    # Round baseline to 2 decimals
     t4["baseline"] = t4["baseline"].round(2)
 
     return t3, t4
@@ -305,7 +319,7 @@ if clicked:
             status.write("Step 2/5: Validating, filtering OFFLINE, & standardizing columns...")
             progress.progress(30)
 
-            unit_df = standardize_unit_file(unit_raw)  # OFFLINE-only filter happens here
+            unit_df = standardize_unit_file(unit_raw)  # OFFLINE filter happens here
             seas_df = standardize_seasonality_file(seas_raw)
 
             status.write("Step 3/5: Calculating outliers & cleaned daily (OFFLINE only)...")
@@ -364,11 +378,11 @@ if clicked:
             if chart_df.empty:
                 st.warning(f'No baseline found for "{selected_mpl}".')
             else:
-                st.caption(f'Showing baseline trend for: {selected_mpl}')
+                st.caption(f"Showing baseline trend for: {selected_mpl}")
                 st.line_chart(chart_df.set_index("quarter")[["baseline"]])
 
         # ============================================================
-        # Tables (simplified)
+        # Tables
         # ============================================================
         tab1, tab2 = st.tabs([
             "Daily unit sold by MPL - cleaned up",
