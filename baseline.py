@@ -295,7 +295,7 @@ def build_cleaned_and_baseline(unit_df, seasonality_df, upper_q, lower_q, trim_r
 # ============================================================
 # UI
 # ============================================================
-st.title("Guardian Baseline Tool")
+st.title("Baseline Calculator")
 
 with st.sidebar:
     st.header("Parameters")
@@ -398,7 +398,7 @@ if clicked:
         st.download_button(
             "Download output (Excel)",
             data=xbytes,
-            file_name="guardian_baseline_outputs.xlsx",
+            file_name="_baseline_outputs.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
