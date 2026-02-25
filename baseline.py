@@ -91,11 +91,9 @@ def looks_like_real_header(row_values) -> bool:
         hk = norm_key(h)
         if any(hk in k for k in keys):
             hit += 1
-    # if we hit enough keywords, treat it as header
     return hit >= 3
 
 def read_csv_robust(uploaded_file) -> pd.DataFrame:
-    # try normal comma, then semicolon
     uploaded_file.seek(0)
     try:
         return pd.read_csv(uploaded_file)
@@ -103,10 +101,24 @@ def read_csv_robust(uploaded_file) -> pd.DataFrame:
         uploaded_file.seek(0)
         return pd.read_csv(uploaded_file, sep=";")
 
+def _ensure_df(obj, sheet_name=None) -> pd.DataFrame:
+    """
+    pd.read_excel can return dict when sheet_name=None.
+    This function converts dict -> one DataFrame.
+    """
+    if isinstance(obj, dict):
+        # pick selected sheet if provided, else first sheet
+        if sheet_name and sheet_name in obj:
+            return obj[sheet_name]
+        first_key = list(obj.keys())[0]
+        return obj[first_key]
+    return obj
+
 def read_excel_robust(uploaded_file, sheet_name=None) -> pd.DataFrame:
-    # Step 1: read first 30 rows with header=None to find header row
+    # read first 30 rows with header=None to find header row
     uploaded_file.seek(0)
     preview = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=None, nrows=30)
+    preview = _ensure_df(preview, sheet_name=sheet_name)
 
     header_row_idx = None
     for i in range(min(30, len(preview))):
@@ -114,14 +126,13 @@ def read_excel_robust(uploaded_file, sheet_name=None) -> pd.DataFrame:
             header_row_idx = i
             break
 
-    # Step 2: read full file using detected header row
     uploaded_file.seek(0)
     if header_row_idx is None:
-        # fallback: assume row 0
         df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=0)
     else:
         df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=header_row_idx)
 
+    df = _ensure_df(df, sheet_name=sheet_name)
     return df
 
 def read_any_table(uploaded_file, sheet_name=None) -> pd.DataFrame:
@@ -167,9 +178,7 @@ def find_col_by_alias(df: pd.DataFrame, candidates: list[str]) -> str | None:
 def standardize_unit_file(df_raw: pd.DataFrame) -> pd.DataFrame:
     df = df_raw.copy()
 
-    resolved = {}
-    for canonical, alias_list in UNIT_ALIASES.items():
-        resolved[canonical] = find_col_by_alias(df, alias_list)
+    resolved = {k: find_col_by_alias(df, v) for k, v in UNIT_ALIASES.items()}
 
     required = ["EAN CODE", "SUPPORT%", "SUM OF QTY SUM", "TRANSACTION DATE", "QUARTER", "MPL 2026", "ONLINE/OFFLINE"]
     missing_required = [k for k in required if resolved.get(k) is None]
@@ -302,7 +311,7 @@ with st.sidebar:
     upper_q = st.number_input("Upper fence percentile", 0.0, 1.0, 0.80, 0.01)
     lower_q = st.number_input("Lower fence percentile", 0.0, 1.0, 0.10, 0.01)
     trim_ratio = st.number_input("Trim ratio", 0.0, 0.8, 0.20, 0.05)
-    st.caption("Note: Tool will automatically use OFFLINE rows only (Type Store = OFFLINE).")
+    st.caption("Note: Tool uses OFFLINE rows only (Type Store = OFFLINE).")
 
 c1, c2 = st.columns(2)
 with c1:
@@ -310,15 +319,25 @@ with c1:
 with c2:
     f_seas = st.file_uploader("Upload Seasonality Calendar", type=["csv", "xlsx", "xls", "parquet"])
 
-# If unit file is excel, allow sheet selection
-sheet_choice = None
+# Sheet selector (Unit)
+unit_sheet = None
 if f_unit and f_unit.name.lower().endswith((".xlsx", ".xls")):
     try:
         f_unit.seek(0)
         xl = pd.ExcelFile(f_unit)
-        sheet_choice = st.selectbox("Select sheet (Unit Sold File)", xl.sheet_names, index=0)
+        unit_sheet = st.selectbox("Select sheet (Unit Sold File)", xl.sheet_names, index=0)
     except Exception:
-        sheet_choice = None
+        unit_sheet = None
+
+# Sheet selector (Seasonality) - optional but safe
+seas_sheet = None
+if f_seas and f_seas.name.lower().endswith((".xlsx", ".xls")):
+    try:
+        f_seas.seek(0)
+        xl2 = pd.ExcelFile(f_seas)
+        seas_sheet = st.selectbox("Select sheet (Seasonality Calendar)", xl2.sheet_names, index=0)
+    except Exception:
+        seas_sheet = None
 
 clicked = st.button("Calculate Baseline", type="primary", disabled=not (f_unit and f_seas))
 
@@ -335,8 +354,8 @@ if clicked:
             status.write("Step 1/5: Reading files...")
             progress.progress(10)
 
-            unit_raw = read_any_table(f_unit, sheet_name=sheet_choice)
-            seas_raw = read_any_table(f_seas)
+            unit_raw = read_any_table(f_unit, sheet_name=unit_sheet)
+            seas_raw = read_any_table(f_seas, sheet_name=seas_sheet)
 
             status.write("Step 2/5: Validating, filtering OFFLINE, & standardizing columns...")
             progress.progress(30)
@@ -398,7 +417,7 @@ if clicked:
         st.download_button(
             "Download output (Excel)",
             data=xbytes,
-            file_name="_baseline_outputs.xlsx",
+            file_name="guardian_baseline_outputs.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
