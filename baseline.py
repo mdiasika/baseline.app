@@ -4,28 +4,16 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="Guardian Baseline Tool", layout="wide")
+st.set_page_config(page_title="Baseline Calculator", layout="wide")
 
 # ============================================================
 # Helpers
 # ============================================================
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [str(c) for c in df.columns]
-    return df
-
 def norm_key(s: str) -> str:
-    """
-    Normalize column name to robust matching key:
-    - uppercase
-    - replace non-alphanumeric with space
-    - collapse spaces
-    """
-    s = str(s)
-    s = s.replace("\u00A0", " ")  # NBSP -> space
+    s = str(s).replace("\u00A0", " ")
     s = s.strip().upper()
-    s = re.sub(r"[^A-Z0-9]+", " ", s)   # keep only A-Z0-9, others -> space
-    s = re.sub(r"\s+", " ", s).strip() # collapse spaces
+    s = re.sub(r"[^A-Z0-9]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
     return s
 
 def ensure_datetime_dmy(s: pd.Series) -> pd.Series:
@@ -48,16 +36,6 @@ def trimmed_mean(arr: np.ndarray, trim_ratio: float = 0.20) -> float:
     arr_sorted = np.sort(arr)
     trimmed = arr_sorted[k : n - k]
     return float(np.mean(trimmed)) if trimmed.size else np.nan
-
-def read_any_table(uploaded_file) -> pd.DataFrame:
-    name = uploaded_file.name.lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(uploaded_file)
-    if name.endswith(".xlsx") or name.endswith(".xls"):
-        return pd.read_excel(uploaded_file)
-    if name.endswith(".parquet"):
-        return pd.read_parquet(uploaded_file)
-    raise ValueError("Supported file types: .csv, .xlsx/.xls, .parquet")
 
 def format_date_mmddyyyy(df: pd.DataFrame, col: str = "transaction_date") -> pd.DataFrame:
     df = df.copy()
@@ -88,8 +66,7 @@ def add_quarter_index(df: pd.DataFrame, quarter_col: str = "quarter") -> pd.Data
 def normalize_channel_value(x) -> str:
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return ""
-    s = str(x).strip().upper()
-    s = s.replace("\u00A0", " ")
+    s = str(x).replace("\u00A0", " ").strip().upper()
     s = re.sub(r"\s+", " ", s).strip()
     if s in {"OFFLINE", "OFF LINE", "OFF-LINE", "STORE", "INSTORE", "IN-STORE"}:
         return "OFFLINE"
@@ -98,7 +75,67 @@ def normalize_channel_value(x) -> str:
     return s
 
 # ============================================================
-# Column aliases (robust)
+# Robust Excel/CSV Reader (auto-detect header row)
+# ============================================================
+HEADER_HINTS = [
+    "EAN", "EAN CODE", "SUPPORT", "SUPPORT%", "QTY", "SUM OF QTY",
+    "TRANSACTION", "DATE", "QUARTER", "MPL", "TYPE STORE", "ONLINE", "OFFLINE"
+]
+
+def looks_like_real_header(row_values) -> bool:
+    keys = [norm_key(v) for v in row_values if str(v).strip() not in {"", "nan", "None"}]
+    if not keys:
+        return False
+    hit = 0
+    for h in HEADER_HINTS:
+        hk = norm_key(h)
+        if any(hk in k for k in keys):
+            hit += 1
+    # if we hit enough keywords, treat it as header
+    return hit >= 3
+
+def read_csv_robust(uploaded_file) -> pd.DataFrame:
+    # try normal comma, then semicolon
+    uploaded_file.seek(0)
+    try:
+        return pd.read_csv(uploaded_file)
+    except Exception:
+        uploaded_file.seek(0)
+        return pd.read_csv(uploaded_file, sep=";")
+
+def read_excel_robust(uploaded_file, sheet_name=None) -> pd.DataFrame:
+    # Step 1: read first 30 rows with header=None to find header row
+    uploaded_file.seek(0)
+    preview = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=None, nrows=30)
+
+    header_row_idx = None
+    for i in range(min(30, len(preview))):
+        if looks_like_real_header(preview.iloc[i].tolist()):
+            header_row_idx = i
+            break
+
+    # Step 2: read full file using detected header row
+    uploaded_file.seek(0)
+    if header_row_idx is None:
+        # fallback: assume row 0
+        df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=0)
+    else:
+        df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=header_row_idx)
+
+    return df
+
+def read_any_table(uploaded_file, sheet_name=None) -> pd.DataFrame:
+    name = uploaded_file.name.lower()
+    if name.endswith(".csv"):
+        return read_csv_robust(uploaded_file)
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        return read_excel_robust(uploaded_file, sheet_name=sheet_name)
+    if name.endswith(".parquet"):
+        return pd.read_parquet(uploaded_file)
+    raise ValueError("Supported file types: .csv, .xlsx/.xls, .parquet")
+
+# ============================================================
+# Column aliases
 # ============================================================
 UNIT_ALIASES = {
     "EAN CODE": ["EAN CODE", "EAN", "EAN_CODE", "EANCODE", "BARCODE"],
@@ -107,13 +144,11 @@ UNIT_ALIASES = {
     "TRANSACTION DATE": ["TRANSACTION DATE", "TRANSACTION_DATE", "TRANSACTIONDATE", "DATE", "TRANS DATE"],
     "QUARTER": ["QUARTER", "QTR", "QUARTER NO", "QUARTER_NUMBER"],
     "MPL 2026": ["MPL 2026", "MPL2026", "MPL", "MPL NAME", "MPL_NAME"],
-    # Channel column: your real header is "Type Store"
     "ONLINE/OFFLINE": [
+        "TYPE STORE", "TYPE_STORE", "TYPE-STORE", "TYPESTORE",
         "ONLINE/OFFLINE", "ONLINE OFFLINE", "ONLINE_OFFLINE",
-        "CHANNEL", "SALES CHANNEL",
-        "TYPE STORE", "TYPE_STORE", "TYPE-STORE", "TYPESTORE"
+        "CHANNEL", "SALES CHANNEL"
     ],
-    # Promo type: your real header is "Promotion Type"
     "PROMO TYPE": ["PROMOTION TYPE", "PROMO TYPE", "PROMO_TYPE", "PROMOTION_TYPE"],
 }
 
@@ -122,9 +157,6 @@ SEAS_ALIASES = {
 }
 
 def find_col_by_alias(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    """
-    Match by normalized key (handles extra spaces, underscores, hyphens, NBSP, etc.)
-    """
     key_to_actual = {norm_key(c): c for c in df.columns}
     for cand in candidates:
         ck = norm_key(cand)
@@ -133,11 +165,7 @@ def find_col_by_alias(df: pd.DataFrame, candidates: list[str]) -> str | None:
     return None
 
 def standardize_unit_file(df_raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    Standardize + FILTER OFFLINE ONLY.
-    Also captures Promotion Type as promo_type (if available).
-    """
-    df = normalize_columns(df_raw)
+    df = df_raw.copy()
 
     resolved = {}
     for canonical, alias_list in UNIT_ALIASES.items():
@@ -146,7 +174,6 @@ def standardize_unit_file(df_raw: pd.DataFrame) -> pd.DataFrame:
     required = ["EAN CODE", "SUPPORT%", "SUM OF QTY SUM", "TRANSACTION DATE", "QUARTER", "MPL 2026", "ONLINE/OFFLINE"]
     missing_required = [k for k in required if resolved.get(k) is None]
     if missing_required:
-        # show detected columns (safe) to help debugging without showing values
         detected = [str(c) for c in df.columns]
         raise ValueError(f"Missing required columns in unit file: {missing_required}. Detected columns: {detected}")
 
@@ -166,7 +193,7 @@ def standardize_unit_file(df_raw: pd.DataFrame) -> pd.DataFrame:
 
     df = df.rename(columns=rename_map)
 
-    # --- Filter OFFLINE only (IMPORTANT)
+    # OFFLINE filter
     df["channel_norm"] = df["channel"].apply(normalize_channel_value)
     df_off = df[df["channel_norm"] == "OFFLINE"].copy()
     if df_off.empty:
@@ -185,57 +212,46 @@ def standardize_unit_file(df_raw: pd.DataFrame) -> pd.DataFrame:
 
     df["ean"] = df["ean"].astype(str).str.strip()
     df["mpl"] = df["mpl"].astype(str).str.strip()
-
     df["unit_sold"] = pd.to_numeric(df["unit_sold"], errors="coerce")
-    df["discount_pct"] = parse_support_pct_0_100(df["discount_pct"])  # 23% -> 23
+    df["discount_pct"] = parse_support_pct_0_100(df["discount_pct"])
 
-    # promo_type (optional)
     if "promo_type" not in df.columns:
         df["promo_type"] = "UNKNOWN"
     else:
         df["promo_type"] = df["promo_type"].astype(str).str.strip()
         df.loc[df["promo_type"].isin(["", "nan", "None", "NAN"]), "promo_type"] = "UNKNOWN"
 
-    # Build quarter label: YYYYQ#
     q = pd.to_numeric(df["quarter_raw"], errors="coerce").astype("Int64")
     year = df["transaction_date"].dt.year.astype("Int64")
     df["quarter"] = year.astype(str) + "Q" + q.astype(str)
-
     df = df.rename(columns={"channel_norm": "channel"})
 
     return df[["transaction_date", "quarter", "ean", "mpl", "unit_sold", "discount_pct", "promo_type", "channel"]]
 
 def standardize_seasonality_file(df_raw: pd.DataFrame) -> pd.DataFrame:
-    df = normalize_columns(df_raw)
-
+    df = df_raw.copy()
     date_col = find_col_by_alias(df, SEAS_ALIASES["DATE"])
     if date_col is None:
-        raise ValueError("Seasonality file: kolom tanggal tidak ditemukan (contoh: Date).")
+        detected = [str(c) for c in df.columns]
+        raise ValueError(f"Seasonality file: kolom tanggal tidak ditemukan. Detected columns: {detected}")
 
     df = df.rename(columns={date_col: "transaction_date"})
     df["transaction_date"] = ensure_datetime_dmy(df["transaction_date"])
     if df["transaction_date"].isna().all():
         raise ValueError("Seasonality Date gagal diparse. Pastikan format dd/mm/yy atau dd/mm/yyyy.")
-
     return df[["transaction_date"]].dropna().drop_duplicates()
 
 # ============================================================
 # Core processing
 # ============================================================
 def build_cleaned_and_baseline(unit_df, seasonality_df, upper_q, lower_q, trim_ratio):
-    # unit_df is already OFFLINE-only
-
-    # Daily by MPL (still keeps discount_pct & promo_type)
     t1 = (
         unit_df.groupby(["transaction_date", "quarter", "mpl", "discount_pct", "promo_type"], as_index=False)
                .agg(unit_sold=("unit_sold", "sum"))
     )
-
-    # seasonality flag
     seas_set = set(seasonality_df["transaction_date"].unique())
     t1["seasonality_flag"] = np.where(t1["transaction_date"].isin(seas_set), "Y", "N")
 
-    # outlier fences (non-seasonality only)
     base_for_fence = t1.loc[
         (t1["seasonality_flag"] == "N") & t1["unit_sold"].notna(),
         ["mpl", "quarter", "unit_sold"]
@@ -249,9 +265,7 @@ def build_cleaned_and_baseline(unit_df, seasonality_df, upper_q, lower_q, trim_r
         .rename(columns={lower_q: "lower_fence", upper_q: "upper_fence"})
     )
 
-    # cleaned daily (Table 3)
     t3 = t1.merge(fence, on=["mpl", "quarter"], how="left")
-
     in_fence = t3["unit_sold"].ge(t3["lower_fence"]) & t3["unit_sold"].le(t3["upper_fence"])
     t3["outlier_flag"] = np.where(
         t3["lower_fence"].notna() & t3["upper_fence"].notna(),
@@ -259,8 +273,7 @@ def build_cleaned_and_baseline(unit_df, seasonality_df, upper_q, lower_q, trim_r
         "N"
     )
 
-    # baseline (Table 4)
-    weekday_ok = t3["transaction_date"].dt.weekday <= 4  # Mon-Fri only
+    weekday_ok = t3["transaction_date"].dt.weekday <= 4
     baseline_input = t3.loc[
         (t3["seasonality_flag"] == "N") &
         (t3["outlier_flag"] == "N") &
@@ -277,11 +290,10 @@ def build_cleaned_and_baseline(unit_df, seasonality_df, upper_q, lower_q, trim_r
                       .agg(baseline=("unit_sold", agg_trimmean))
     )
     t4["baseline"] = t4["baseline"].round(2)
-
     return t3, t4
 
 # ============================================================
-# UI (Sales-friendly)
+# UI
 # ============================================================
 st.title("Guardian Baseline Tool")
 
@@ -298,6 +310,16 @@ with c1:
 with c2:
     f_seas = st.file_uploader("Upload Seasonality Calendar", type=["csv", "xlsx", "xls", "parquet"])
 
+# If unit file is excel, allow sheet selection
+sheet_choice = None
+if f_unit and f_unit.name.lower().endswith((".xlsx", ".xls")):
+    try:
+        f_unit.seek(0)
+        xl = pd.ExcelFile(f_unit)
+        sheet_choice = st.selectbox("Select sheet (Unit Sold File)", xl.sheet_names, index=0)
+    except Exception:
+        sheet_choice = None
+
 clicked = st.button("Calculate Baseline", type="primary", disabled=not (f_unit and f_seas))
 
 if clicked:
@@ -313,13 +335,13 @@ if clicked:
             status.write("Step 1/5: Reading files...")
             progress.progress(10)
 
-            unit_raw = read_any_table(f_unit)
+            unit_raw = read_any_table(f_unit, sheet_name=sheet_choice)
             seas_raw = read_any_table(f_seas)
 
             status.write("Step 2/5: Validating, filtering OFFLINE, & standardizing columns...")
             progress.progress(30)
 
-            unit_df = standardize_unit_file(unit_raw)  # OFFLINE filter happens here
+            unit_df = standardize_unit_file(unit_raw)
             seas_df = standardize_seasonality_file(seas_raw)
 
             status.write("Step 3/5: Calculating outliers & cleaned daily (OFFLINE only)...")
@@ -347,51 +369,29 @@ if clicked:
 
         st.success("Completed")
 
-        # ============================================================
-        # Baseline trend chart (Top 20 MPL selector)
-        # ============================================================
         st.subheader("Baseline trend (quarter-to-quarter)")
-
         baseline_for_rank = baseline.copy()
         baseline_for_rank["mpl"] = baseline_for_rank["mpl"].astype(str).str.strip()
 
-        mpl_rank = (
-            baseline_for_rank.groupby("mpl")["quarter"]
-            .nunique()
-            .sort_values(ascending=False)
-        )
+        mpl_rank = baseline_for_rank.groupby("mpl")["quarter"].nunique().sort_values(ascending=False)
         top20_mpl = mpl_rank.head(20).index.tolist()
 
         if not top20_mpl:
             st.warning("No baseline data available to plot.")
         else:
             default_mpl = "MYB_SSMI" if "MYB_SSMI" in top20_mpl else top20_mpl[0]
-            selected_mpl = st.selectbox(
-                "Select MPL (Top 20 by coverage)",
-                top20_mpl,
-                index=top20_mpl.index(default_mpl)
-            )
+            selected_mpl = st.selectbox("Select MPL (Top 20 by coverage)", top20_mpl, index=top20_mpl.index(default_mpl))
 
             chart_df = baseline_for_rank[baseline_for_rank["mpl"] == selected_mpl].copy()
             chart_df = add_quarter_index(chart_df, "quarter").sort_values("quarter_index")
+            st.line_chart(chart_df.set_index("quarter")[["baseline"]])
 
-            if chart_df.empty:
-                st.warning(f'No baseline found for "{selected_mpl}".')
-            else:
-                st.caption(f"Showing baseline trend for: {selected_mpl}")
-                st.line_chart(chart_df.set_index("quarter")[["baseline"]])
-
-        # ============================================================
-        # Tables
-        # ============================================================
         tab1, tab2 = st.tabs([
             "Daily unit sold by MPL - cleaned up",
             "Baseline by MPL x quarter"
         ])
-
         with tab1:
             st.dataframe(cleaned_daily_fmt, use_container_width=True)
-
         with tab2:
             st.dataframe(baseline, use_container_width=True)
 
