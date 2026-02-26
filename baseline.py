@@ -22,7 +22,6 @@ def ensure_datetime_dmy(s: pd.Series) -> pd.Series:
     return dt.dt.normalize()
 
 def parse_support_pct_0_100(s: pd.Series) -> pd.Series:
-    # "23%" -> 23
     x = s.astype(str).str.strip().str.replace("%", "", regex=False)
     return pd.to_numeric(x, errors="coerce")
 
@@ -32,7 +31,7 @@ def trimmed_mean(arr: np.ndarray, trim_ratio: float = 0.20) -> float:
     n = arr.size
     if n == 0:
         return np.nan
-    k = int(np.floor((trim_ratio / 2.0) * n))  # each side
+    k = int(np.floor((trim_ratio / 2.0) * n))
     if n - 2 * k <= 0:
         return np.nan
     arr_sorted = np.sort(arr)
@@ -248,10 +247,6 @@ def standardize_seasonality_file(df_raw: pd.DataFrame) -> pd.DataFrame:
 
 # ============================================================
 # Core processing (match Excel logic)
-# - baseline calculated from DAILY TOTAL per MPL (not split by promo/discount)
-# - fences calculated from non-seasonality, unit_sold > 0
-# - baseline from non-seasonality, non-outlier, weekday Mon-Fri, unit_sold > 0
-# - flags joined back to detail rows for display
 # ============================================================
 def build_cleaned_and_baseline(unit_df, seasonality_df, upper_q, lower_q, trim_ratio):
     # (A) Detail for display
@@ -300,7 +295,7 @@ def build_cleaned_and_baseline(unit_df, seasonality_df, upper_q, lower_q, trim_r
         how="left"
     )
 
-    # (D) Baseline from base daily totals (match Excel)
+    # (D) Baseline from base daily totals
     weekday_ok = t_base["transaction_date"].dt.weekday <= 4  # Mon-Fri
     baseline_input = t_base[
         (t_base["seasonality_flag"] == "N") &
@@ -320,6 +315,30 @@ def build_cleaned_and_baseline(unit_df, seasonality_df, upper_q, lower_q, trim_r
     t4["baseline"] = t4["baseline"].round(2)
 
     return t3, t4
+
+# ============================================================
+# Chart MPL list (fixed list you provided)
+# ============================================================
+CHART_MPL_LIST = [
+    "MYB_SSMI",
+    "GSN_MICELLAR_BASIC_125",
+    "MYB_SSVI",
+    "GSN_MICELLAR_BASIC_400",
+    "MYB_FIT ME COMPACT PWD 12HR",
+    "MYB_HYPERCURL",
+    "MYB_SKY HIGH",
+    "GCN_BIG KIT",
+    "MYB_MAGNUM",
+    "GSN_CLEANSER_BC_100",
+    "LMU_INF LE MATTE RESISTANCE",
+    "ELS_HA PURE SHP COND",
+    "MYB_HYPERSHARP",
+    "ELS_XO GOLD_100",
+    "ELS_SHP_280",
+    "DEX_GLYCO_MOIST_50",
+    "DEX_GLYCO_SERUM_30",
+    "ELS_GLYCOLIC GLOSS_280",
+]
 
 # ============================================================
 # UI
@@ -408,23 +427,24 @@ if clicked:
         st.success("Completed")
 
         # ============================================================
-        # Baseline trend chart (Top 20 MPL selector) + DATA LABELS
+        # Baseline trend chart (your fixed MPL list) + DATA LABELS
         # ============================================================
         st.subheader("Baseline trend (quarter-to-quarter)")
 
-        baseline_for_rank = baseline.copy()
-        baseline_for_rank["mpl"] = baseline_for_rank["mpl"].astype(str).str.strip()
+        baseline_chart = baseline.copy()
+        baseline_chart["mpl"] = baseline_chart["mpl"].astype(str).str.strip()
 
-        mpl_rank = baseline_for_rank.groupby("mpl")["quarter"].nunique().sort_values(ascending=False)
-        top20_mpl = mpl_rank.head(20).index.tolist()
+        # Keep only MPLs from your list (and only those present in results)
+        present = sorted(set(baseline_chart["mpl"].unique().tolist()))
+        dropdown_list = [m for m in CHART_MPL_LIST if m in present]
 
-        if not top20_mpl:
-            st.warning("No baseline data available to plot.")
+        if not dropdown_list:
+            st.warning("None of the predefined MPL list exists in this baseline output.")
         else:
-            default_mpl = "MYB_SSMI" if "MYB_SSMI" in top20_mpl else top20_mpl[0]
-            selected_mpl = st.selectbox("Select MPL (Top 20 by coverage)", top20_mpl, index=top20_mpl.index(default_mpl))
+            default_mpl = "MYB_SSMI" if "MYB_SSMI" in dropdown_list else dropdown_list[0]
+            selected_mpl = st.selectbox("Select MPL (predefined list)", dropdown_list, index=dropdown_list.index(default_mpl))
 
-            chart_df = baseline_for_rank[baseline_for_rank["mpl"] == selected_mpl].copy()
+            chart_df = baseline_chart[baseline_chart["mpl"] == selected_mpl].copy()
             chart_df["quarter"] = pd.to_numeric(chart_df["quarter"], errors="coerce")
             chart_df = chart_df.dropna(subset=["quarter"]).sort_values("quarter")
             chart_df["quarter_label"] = "Q" + chart_df["quarter"].astype(int).astype(str)
@@ -441,12 +461,7 @@ if clicked:
 
                 line = base.mark_line()
                 points = base.mark_point()
-
-                labels = base.mark_text(
-                    dy=-10
-                ).encode(
-                    text=alt.Text("baseline:Q", format=".2f")
-                )
+                labels = base.mark_text(dy=-10).encode(text=alt.Text("baseline:Q", format=".2f"))
 
                 st.altair_chart((line + points + labels).properties(height=320), use_container_width=True)
 
