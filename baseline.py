@@ -3,8 +3,9 @@ import re
 import numpy as np
 import pandas as pd
 import streamlit as st
+import altair as alt
 
-st.set_page_config(page_title="Baseline Calculator", layout="wide")
+st.set_page_config(page_title="Guardian Baseline Tool", layout="wide")
 
 # ============================================================
 # Helpers
@@ -21,6 +22,7 @@ def ensure_datetime_dmy(s: pd.Series) -> pd.Series:
     return dt.dt.normalize()
 
 def parse_support_pct_0_100(s: pd.Series) -> pd.Series:
+    # "23%" -> 23
     x = s.astype(str).str.strip().str.replace("%", "", regex=False)
     return pd.to_numeric(x, errors="coerce")
 
@@ -30,7 +32,7 @@ def trimmed_mean(arr: np.ndarray, trim_ratio: float = 0.20) -> float:
     n = arr.size
     if n == 0:
         return np.nan
-    k = int(np.floor((trim_ratio / 2.0) * n))
+    k = int(np.floor((trim_ratio / 2.0) * n))  # each side
     if n - 2 * k <= 0:
         return np.nan
     arr_sorted = np.sort(arr)
@@ -53,15 +55,8 @@ def to_excel_bytes(cleaned_daily: pd.DataFrame, baseline: pd.DataFrame) -> bytes
 def safe_error(msg: str, err: Exception):
     st.error(msg)
     with st.expander("Detail error (safe)"):
-        st.write(f"Type: {type(err).__name__}")
+        st.write(f"Type: {type(err)._name_}")
         st.write(f"Message: {str(err)}")
-
-def add_quarter_index(df: pd.DataFrame, quarter_col: str = "quarter") -> pd.DataFrame:
-    out = df.copy()
-    year = out[quarter_col].astype(str).str.extract(r"(\d{4})")[0].astype(float)
-    q = out[quarter_col].astype(str).str.extract(r"Q([1-4])")[0].astype(float)
-    out["quarter_index"] = (year * 10 + q).astype("Int64")
-    return out
 
 def normalize_channel_value(x) -> str:
     if x is None or (isinstance(x, float) and np.isnan(x)):
@@ -102,12 +97,7 @@ def read_csv_robust(uploaded_file) -> pd.DataFrame:
         return pd.read_csv(uploaded_file, sep=";")
 
 def _ensure_df(obj, sheet_name=None) -> pd.DataFrame:
-    """
-    pd.read_excel can return dict when sheet_name=None.
-    This function converts dict -> one DataFrame.
-    """
     if isinstance(obj, dict):
-        # pick selected sheet if provided, else first sheet
         if sheet_name and sheet_name in obj:
             return obj[sheet_name]
         first_key = list(obj.keys())[0]
@@ -115,7 +105,6 @@ def _ensure_df(obj, sheet_name=None) -> pd.DataFrame:
     return obj
 
 def read_excel_robust(uploaded_file, sheet_name=None) -> pd.DataFrame:
-    # read first 30 rows with header=None to find header row
     uploaded_file.seek(0)
     preview = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=None, nrows=30)
     preview = _ensure_df(preview, sheet_name=sheet_name)
@@ -154,7 +143,7 @@ UNIT_ALIASES = {
     "SUM OF QTY SUM": ["SUM OF QTY SUM", "SUM OF QTY", "QTY", "QTY SUM", "UNITS", "UNIT SOLD", "UNIT_SOLD"],
     "TRANSACTION DATE": ["TRANSACTION DATE", "TRANSACTION_DATE", "TRANSACTIONDATE", "DATE", "TRANS DATE"],
     "QUARTER": ["QUARTER", "QTR", "QUARTER NO", "QUARTER_NUMBER"],
-    "MPL 2026": ["MPL 2026", "MPL2026", "MPL", "MPL NAME", "MPL_NAME"],
+    "MPL 2026": ["MPL 2026", "MPL2026", "MPL", "MPL NAME", "MPL_NAME", "MPL 2025", "MPL2025"],
     "ONLINE/OFFLINE": [
         "TYPE STORE", "TYPE_STORE", "TYPE-STORE", "TYPESTORE",
         "ONLINE/OFFLINE", "ONLINE OFFLINE", "ONLINE_OFFLINE",
@@ -175,6 +164,9 @@ def find_col_by_alias(df: pd.DataFrame, candidates: list[str]) -> str | None:
             return key_to_actual[ck]
     return None
 
+# ============================================================
+# Standardization
+# ============================================================
 def standardize_unit_file(df_raw: pd.DataFrame) -> pd.DataFrame:
     df = df_raw.copy()
 
@@ -191,7 +183,7 @@ def standardize_unit_file(df_raw: pd.DataFrame) -> pd.DataFrame:
         resolved["SUPPORT%"]: "discount_pct",
         resolved["SUM OF QTY SUM"]: "unit_sold",
         resolved["TRANSACTION DATE"]: "transaction_date",
-        resolved["QUARTER"]: "quarter_raw",
+        resolved["QUARTER"]: "quarter",
         resolved["MPL 2026"]: "mpl",
         resolved["ONLINE/OFFLINE"]: "channel",
     }
@@ -214,27 +206,31 @@ def standardize_unit_file(df_raw: pd.DataFrame) -> pd.DataFrame:
         )
     df = df_off
 
-    # types
+    # Parse date
     df["transaction_date"] = ensure_datetime_dmy(df["transaction_date"])
     if df["transaction_date"].isna().all():
         raise ValueError("Transaction Date gagal diparse. Pastikan format dd/mm/yy atau dd/mm/yyyy.")
 
+    # Types
     df["ean"] = df["ean"].astype(str).str.strip()
     df["mpl"] = df["mpl"].astype(str).str.strip()
-    df["unit_sold"] = pd.to_numeric(df["unit_sold"], errors="coerce")
-    df["discount_pct"] = parse_support_pct_0_100(df["discount_pct"])
 
+    df["unit_sold"] = pd.to_numeric(df["unit_sold"], errors="coerce")
+    df["discount_pct"] = parse_support_pct_0_100(df["discount_pct"])  # 23% -> 23
+
+    # Quarter: keep as 1..4 (match your Excel)
+    df["quarter"] = pd.to_numeric(df["quarter"], errors="coerce").astype("Int64")
+    if df["quarter"].isna().all():
+        raise ValueError("Quarter gagal diparse (expected 1-4).")
+
+    # Promo type (optional)
     if "promo_type" not in df.columns:
         df["promo_type"] = "UNKNOWN"
     else:
         df["promo_type"] = df["promo_type"].astype(str).str.strip()
         df.loc[df["promo_type"].isin(["", "nan", "None", "NAN"]), "promo_type"] = "UNKNOWN"
 
-    q = pd.to_numeric(df["quarter_raw"], errors="coerce").astype("Int64")
-    year = df["transaction_date"].dt.year.astype("Int64")
-    df["quarter"] = year.astype(str) + "Q" + q.astype(str)
     df = df.rename(columns={"channel_norm": "channel"})
-
     return df[["transaction_date", "quarter", "ean", "mpl", "unit_sold", "discount_pct", "promo_type", "channel"]]
 
 def standardize_seasonality_file(df_raw: pd.DataFrame) -> pd.DataFrame:
@@ -251,45 +247,68 @@ def standardize_seasonality_file(df_raw: pd.DataFrame) -> pd.DataFrame:
     return df[["transaction_date"]].dropna().drop_duplicates()
 
 # ============================================================
-# Core processing
+# Core processing (match Excel logic)
+# - baseline calculated from DAILY TOTAL per MPL (not split by promo/discount)
+# - fences calculated from non-seasonality, unit_sold > 0
+# - baseline from non-seasonality, non-outlier, weekday Mon-Fri, unit_sold > 0
+# - flags joined back to detail rows for display
 # ============================================================
 def build_cleaned_and_baseline(unit_df, seasonality_df, upper_q, lower_q, trim_ratio):
-    t1 = (
+    # (A) Detail for display
+    t1_detail = (
         unit_df.groupby(["transaction_date", "quarter", "mpl", "discount_pct", "promo_type"], as_index=False)
                .agg(unit_sold=("unit_sold", "sum"))
     )
-    seas_set = set(seasonality_df["transaction_date"].unique())
-    t1["seasonality_flag"] = np.where(t1["transaction_date"].isin(seas_set), "Y", "N")
 
-    base_for_fence = t1.loc[
-        (t1["seasonality_flag"] == "N") & t1["unit_sold"].notna(),
-        ["mpl", "quarter", "unit_sold"]
-    ]
+    # (B) Base daily total per MPL (used for fence + baseline)
+    t1_base = (
+        unit_df.groupby(["transaction_date", "quarter", "mpl"], as_index=False)
+               .agg(unit_sold=("unit_sold", "sum"))
+    )
+
+    seas_set = set(seasonality_df["transaction_date"].unique())
+    t1_base["seasonality_flag"] = np.where(t1_base["transaction_date"].isin(seas_set), "Y", "N")
+
+    # Fence calc input (non-seasonality + positive only)
+    base_for_calc = t1_base[
+        (t1_base["seasonality_flag"] == "N") &
+        (t1_base["unit_sold"].notna()) &
+        (t1_base["unit_sold"] > 0)
+    ].copy()
 
     fence = (
-        base_for_fence.groupby(["mpl", "quarter"])["unit_sold"]
+        base_for_calc.groupby(["mpl", "quarter"])["unit_sold"]
         .quantile([lower_q, upper_q])
         .unstack(level=-1)
         .reset_index()
         .rename(columns={lower_q: "lower_fence", upper_q: "upper_fence"})
     )
 
-    t3 = t1.merge(fence, on=["mpl", "quarter"], how="left")
-    in_fence = t3["unit_sold"].ge(t3["lower_fence"]) & t3["unit_sold"].le(t3["upper_fence"])
-    t3["outlier_flag"] = np.where(
-        t3["lower_fence"].notna() & t3["upper_fence"].notna(),
+    t_base = t1_base.merge(fence, on=["mpl", "quarter"], how="left")
+
+    in_fence = t_base["unit_sold"].ge(t_base["lower_fence"]) & t_base["unit_sold"].le(t_base["upper_fence"])
+    t_base["outlier_flag"] = np.where(
+        t_base["lower_fence"].notna() & t_base["upper_fence"].notna(),
         np.where(in_fence, "N", "Y"),
         "N"
     )
 
-    weekday_ok = t3["transaction_date"].dt.weekday <= 4
-    baseline_input = t3.loc[
-        (t3["seasonality_flag"] == "N") &
-        (t3["outlier_flag"] == "N") &
+    # (C) Display cleaned daily = detail + flags from base
+    t3 = t1_detail.merge(
+        t_base[["transaction_date", "quarter", "mpl", "seasonality_flag", "outlier_flag", "lower_fence", "upper_fence"]],
+        on=["transaction_date", "quarter", "mpl"],
+        how="left"
+    )
+
+    # (D) Baseline from base daily totals (match Excel)
+    weekday_ok = t_base["transaction_date"].dt.weekday <= 4  # Mon-Fri
+    baseline_input = t_base[
+        (t_base["seasonality_flag"] == "N") &
+        (t_base["outlier_flag"] == "N") &
         weekday_ok &
-        t3["unit_sold"].notna(),
-        ["mpl", "quarter", "unit_sold"]
-    ]
+        (t_base["unit_sold"].notna()) &
+        (t_base["unit_sold"] > 0)
+    ][["mpl", "quarter", "unit_sold"]]
 
     def agg_trimmean(s: pd.Series) -> float:
         return trimmed_mean(s.to_numpy(dtype=float), trim_ratio=trim_ratio)
@@ -299,18 +318,19 @@ def build_cleaned_and_baseline(unit_df, seasonality_df, upper_q, lower_q, trim_r
                       .agg(baseline=("unit_sold", agg_trimmean))
     )
     t4["baseline"] = t4["baseline"].round(2)
+
     return t3, t4
 
 # ============================================================
 # UI
 # ============================================================
-st.title("Baseline Calculator")
+st.title("Guardian Baseline Tool")
 
 with st.sidebar:
     st.header("Parameters")
     upper_q = st.number_input("Upper fence percentile", 0.0, 1.0, 0.80, 0.01)
     lower_q = st.number_input("Lower fence percentile", 0.0, 1.0, 0.10, 0.01)
-    trim_ratio = st.number_input("Trim ratio", 0.0, 0.8, 0.20, 0.05)
+    trim_ratio = st.number_input("Trim ratio (TRIMMEAN proportion)", 0.0, 0.8, 0.20, 0.05)
     st.caption("Note: Tool uses OFFLINE rows only (Type Store = OFFLINE).")
 
 c1, c2 = st.columns(2)
@@ -319,7 +339,7 @@ with c1:
 with c2:
     f_seas = st.file_uploader("Upload Seasonality Calendar", type=["csv", "xlsx", "xls", "parquet"])
 
-# Sheet selector (Unit)
+# Sheet selectors (safe)
 unit_sheet = None
 if f_unit and f_unit.name.lower().endswith((".xlsx", ".xls")):
     try:
@@ -329,7 +349,6 @@ if f_unit and f_unit.name.lower().endswith((".xlsx", ".xls")):
     except Exception:
         unit_sheet = None
 
-# Sheet selector (Seasonality) - optional but safe
 seas_sheet = None
 if f_seas and f_seas.name.lower().endswith((".xlsx", ".xls")):
     try:
@@ -363,7 +382,7 @@ if clicked:
             unit_df = standardize_unit_file(unit_raw)
             seas_df = standardize_seasonality_file(seas_raw)
 
-            status.write("Step 3/5: Calculating outliers & cleaned daily (OFFLINE only)...")
+            status.write("Step 3/5: Calculating outliers & baseline (OFFLINE only)...")
             progress.progress(60)
 
             cleaned_daily, baseline = build_cleaned_and_baseline(
@@ -388,7 +407,11 @@ if clicked:
 
         st.success("Completed")
 
+        # ============================================================
+        # Baseline trend chart (Top 20 MPL selector) + DATA LABELS
+        # ============================================================
         st.subheader("Baseline trend (quarter-to-quarter)")
+
         baseline_for_rank = baseline.copy()
         baseline_for_rank["mpl"] = baseline_for_rank["mpl"].astype(str).str.strip()
 
@@ -402,17 +425,44 @@ if clicked:
             selected_mpl = st.selectbox("Select MPL (Top 20 by coverage)", top20_mpl, index=top20_mpl.index(default_mpl))
 
             chart_df = baseline_for_rank[baseline_for_rank["mpl"] == selected_mpl].copy()
-            chart_df = add_quarter_index(chart_df, "quarter").sort_values("quarter_index")
-            st.line_chart(chart_df.set_index("quarter")[["baseline"]])
+            chart_df["quarter"] = pd.to_numeric(chart_df["quarter"], errors="coerce")
+            chart_df = chart_df.dropna(subset=["quarter"]).sort_values("quarter")
+            chart_df["quarter_label"] = "Q" + chart_df["quarter"].astype(int).astype(str)
 
+            if chart_df.empty:
+                st.warning(f'No baseline found for "{selected_mpl}".')
+            else:
+                # Altair line + points + text labels
+                base = alt.Chart(chart_df).encode(
+                    x=alt.X("quarter:O", title="Quarter"),
+                    y=alt.Y("baseline:Q", title="Baseline"),
+                    tooltip=["mpl:N", "quarter:O", alt.Tooltip("baseline:Q", format=".2f")]
+                )
+
+                line = base.mark_line()
+                points = base.mark_point()
+
+                labels = base.mark_text(
+                    dy=-10
+                ).encode(
+                    text=alt.Text("baseline:Q", format=".2f")
+                )
+
+                st.altair_chart((line + points + labels).properties(height=320), use_container_width=True)
+
+        # ============================================================
+        # Tables
+        # ============================================================
         tab1, tab2 = st.tabs([
             "Daily unit sold by MPL - cleaned up",
             "Baseline by MPL x quarter"
         ])
+
         with tab1:
             st.dataframe(cleaned_daily_fmt, use_container_width=True)
+
         with tab2:
-            st.dataframe(baseline, use_container_width=True)
+            st.dataframe(baseline.sort_values(["mpl", "quarter"]), use_container_width=True)
 
         st.download_button(
             "Download output (Excel)",
